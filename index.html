@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<!-- 
+  CAVEAT HACKER
+
+  While there is a lot of math here, it was developed without any real rigor,
+  and may contain redunancies, inefficiencies, and just plain stupidities. I'm
+  sure a more experienced mathologist or shader hacker could improve this quite
+  a bit.
+-->
+<meta charset="utf8">
+<title>Time Ring</title>
+
+<style>
+#glcanvas {
+  width: 100vmin;
+  height: 100vmin;
+  position: absolute;
+  top: 0;
+  left: 50%;
+  margin-left: -50vmin;
+}
+</style>
+
+<!-- canvas width/height is set arbitrarily here - this will work at any resolution -->
+<canvas id="glcanvas" width="1024" height="1024"></canvas>
+
+<script src="gl-matrix.js"></script>
+<script>
+// `bumps` is 12 random values which create "bumps" on the outer edge of the
+// ring at 12 equally spaced intervals (this is also the number of hours on a
+// clock but that coincidence isn't intentional). They are meant to move
+// randomly. See `drawScene()` for more details.
+var bumps = Array.apply(undefined, new Array(12)).map(() => Math.random() * 1.0 - 0.5);
+// Acceleration values to apply to `bumps`.
+var bumpAcc = bumps.map(() => 0.0);
+
+// main initialization - starts after the page loads
+function main() {
+  // grab our canvas element and get a GL context
+  const canvas = document.querySelector('#glcanvas');
+  const gl = canvas.getContext('webgl');
+
+  // If we don't have a GL context, give up now
+  if (!gl) {
+    alert('Unable to initialize WebGL. Your browser or machine may not support it.');
+    return;
+  }
+
+  // Vertex shader program
+  //
+  // There is nothing interesting going on here. You'll notice there's no model
+  // view matrix - the camera is at its default location (0,0,0), pointing
+  // in the positive Z direction with up as (0,1,0). And because we're using an
+  // orthographic projection (see `drawScene()`) there is no perspective - the
+  // entire scene is a 4x4 rectangle filling the entire viewport.
+  const vsSource = `
+    attribute vec4 aVertexPosition;
+
+    uniform mat4 uProjectionMatrix;
+
+    varying highp vec3 vPosition;
+
+    void main(void) {
+      vPosition = vec3(aVertexPosition);
+
+      gl_Position = uProjectionMatrix * aVertexPosition;
+    }
+  `;
+
+  // Fragment shader program
+  //
+  // This is where the magic happens.
+  //
+  // The fun thing about this is that there isn't any real geometry to speak of
+  // - there's a rectangle that this fragment shader is applied to but the
+  // actual visuals are purely the result of evaluating a lot of functions. So
+  // this scales to arbitrary resolutions.
+  // 
+  // Unfortunately that means it's at the mercy of your GL driver and GPU - but
+  // what else is new in OpenGL?
+  //
+  // Note: All angles are in radians.
+  const fsSource = `
+    precision mediump float;
+    const float PI = 3.141592653589793;
+    // 12 bumps for the whole circle means they're pi/6 apart.
+    const float BUMP_INTERVAL = PI / 6.0;
+
+    varying highp vec3 vPosition;
+
+    uniform float now;
+    uniform highp float time;
+    uniform float bumps[12];
+
+    // bump_offset calculates how high the "bump" is at this particular angle.
+    // It's interpolated via 'smoothstep()' to create a continuous curve around
+    // the circle. The _wonderful_ if tree is what happens when you can't do
+    // dynamic array indices - this is a GLSL 1.0 limitation and can almost
+    // certainly be cleaned up in a different shader language.
+    float bump_offset(highp float a) {
+      // where are we?
+      int bump_idx = int(a / BUMP_INTERVAL);
+      // evaluate smoothstep between the last index and the next one
+      float bump_step = smoothstep(0.0, BUMP_INTERVAL, mod(a, BUMP_INTERVAL));
+
+      // and scale that between the last index value and the next
+      if (bump_idx == 0) {
+        return bumps[0] + bump_step * (bumps[1] - bumps[0]);
+      } else if (bump_idx == 1) {
+        return bumps[1] + bump_step * (bumps[2] - bumps[1]);
+      } else if (bump_idx == 2) {
+        return bumps[2] + bump_step * (bumps[3] - bumps[2]);
+      } else if (bump_idx == 3) {
+        return bumps[3] + bump_step * (bumps[4] - bumps[3]);
+      } else if (bump_idx == 4) {
+        return bumps[4] + bump_step * (bumps[5] - bumps[4]);
+      } else if (bump_idx == 5) {
+        return bumps[5] + bump_step * (bumps[6] - bumps[5]);
+      } else if (bump_idx == 6) {
+        return bumps[6] + bump_step * (bumps[7] - bumps[6]);
+      } else if (bump_idx == 7) {
+        return bumps[7] + bump_step * (bumps[8] - bumps[7]);
+      } else if (bump_idx == 8) {
+        return bumps[8] + bump_step * (bumps[9] - bumps[8]);
+      } else if (bump_idx == 9) {
+        return bumps[9] + bump_step * (bumps[10] - bumps[9]);
+      } else if (bump_idx == 10) {
+        return bumps[10] + bump_step * (bumps[11] - bumps[10]);
+      } else if (bump_idx == 11) {
+        return bumps[11] + bump_step * (bumps[0] - bumps[11]);
+      }
+    }
+
+    // The Low Frequency Ring
+    //
+    // The LF ring is the smooth undulations defining the outer edge of the
+    // ring (r > 1), inflated by the bump offset.
+    float lf_ring(float a, float r, float offset) {
+      // A series of waves creating periodic but seemingly turbulent motion
+      float turbulence =
+        sin(a         + now / 60.0) * 0.5 +
+        sin(a * 7.0   + -now * 2.5) * 0.35 +
+        sin(a * 13.0  + now * 5.5) * 0.2 +
+        sin(a * 21.0  + -now * 9.5) * 0.07 +
+        sin(a * 57.0  + now * 16.5) * 0.03 +
+        sin(a * 83.0  + -now * 27.5) * 0.01
+        ;
+
+      // a linear function for how much darkness to add. Black from r=1 until
+      // near the edge defined by the bump offset plus turbulence, and
+      // decreasing linearly but steeply at the boundary
+      return 1.1 - (r - 1.0) * 20.0
+        + turbulence * 0.3
+        + offset;
+    }
+
+    // The High Frequency Ring
+    //
+    // The HF ring is the spiky fringe around the edge, extending beyond the LF
+    // ring proportional to the bump offset.
+    float hf_ring(float a, float r, float offset) {
+      // shift time forward slightly
+      float t2 = now + 0.5;
+      // a (relatively) high frequency oscillation to modulate onto the fingers
+      float hf_field =
+        sin(a * 31.0  + t2 /  3.0) * 0.1 +
+        sin(a * 47.0  + t2 /  5.0) * 0.1 +
+        sin(a * 151.0 + t2 / 11.0) * 0.1 +
+        sin(a * 719.0 + t2 / 13.0) * 0.1
+        ;
+
+      // draw them only some distance from the ring, then fade out.
+      float alpha = smoothstep(1.0, 0.0, (r - (1.0 + offset * 0.5)) / 0.3);
+
+      return (hf_field + 0.5) * alpha;
+    }
+
+    // The Inner Ring
+    //
+    // Basically a simpler version of the LF ring, but it works on the inside
+    // undulating towards the center.
+    float i_ring(float a, float r) {
+      float t2 = now + 0.24;
+      float turbulence =
+        sin(a         + t2 / 60.0) * 0.5 +
+        sin(a * 7.0   + -t2 * 2.5) * 0.35 +
+        sin(a * 13.0  + t2 * 5.5) * 0.2
+        ;
+
+      return (r - 0.98) * 50.0 - turbulence * 0.8 + 0.5;
+    }
+
+    // The Clock Hand(s)
+    //
+    // Calculates a sort of rough "bump" at a particular angle. It's a
+    // combination of a bell curve, some cos/sin waves to add texture, and some
+    // more to add motion. The w and h parameters influence the width (distance
+    // around the circle) and height (distance away from the circle) of the
+    // hand. The p parameter is any random value which perturbs the texture
+    // calculations, to add more character.
+    float hand(float a, float r, float angle, float w, float h, float p) {
+      //float offset = exp(-pow((a - angle) / (PI / w), 2.0));
+
+      // limit hand angle to the first rotation
+      float ha = mod(a - angle, 2.0 * PI);
+
+      // fold the x < 0 region over onto PI < x < 2PI
+      float x = ha > PI ? ha - 2.0 * PI : ha;
+
+      // main bell curve factor
+      float ec = exp(-pow(x / (w / 10.0), 2.0));
+
+      // create a slow moving time factor
+      float t = now / 10.0;
+
+      // width factor - scales sin/cos perturbations
+      float wf = (80.0 / (w + (h / 1.5) + p));
+
+      // offset is the curve of the hand function - it defines the boundary
+      // between the inside and outside of the hand.
+      float offset = h * ec * (
+        0.8                                        // 80% main bell curve
+      + 0.2 * cos(wf * x)                          // 20% secondary bumps
+      + 0.05 * sin(2.7 * (wf * x + t + w))  
+      + 0.03 * sin(3.5 * (wf * x - 7.5 * (t + h))) // 8% noise factor
+      + 0.02 * sin((x + now) * (5.0 + w + h))      // 2% creepy circumferential undulations
+      + 0.06 * sin(4.0 * (r - now + h))            // 6% creepy radial undulations
+      );                                           // = 116% awesome
+
+      if (r > offset + 1.0) {
+        // distance outside the hand edge
+        float d = r - (offset + 1.0);
+        // create a smooth edge
+        return 1.0 - smoothstep(0.0, offset, d * 5.0);
+      } else {
+        // ditto inside
+        float d = (1.0 + offset) - r;
+        // create a much more subtle smooth edge that's mostly dark
+        return 1.0 - (0.06 / h) * smoothstep(0.0, offset, d);
+      }
+    }
+
+    void main(void) {
+      // distance from the center
+      float r = length(vPosition.xy);
+      // the angle from the center, in radians
+      highp float a = atan(-vPosition.x, -vPosition.y) + PI;
+
+      // get our bump offset
+      float bump_offset = bump_offset(a);
+
+      // c is our "color" value - we start with pure white and mix in black as
+      // we go.
+      float c = 1.0;
+      if (r > 1.0) {
+        c = mix(c, 0.0, hf_ring(a, r, bump_offset));
+
+        c = mix(c, 0.0, lf_ring(a, r, bump_offset));
+
+        float second_angle = (mod(time, 60.0) / 60.0) * 2.0 * PI;
+        c = mix(c, 0.0, hand(a, r, second_angle, 0.5, 0.5, bumps[0] / 5.0));
+
+        float minute_angle = (mod(time, 3600.0) / 3600.0) * 2.0 * PI;
+        c = mix(c, 0.0, hand(a, r, minute_angle, 1.0, 0.4, bumps[1] / 7.5));
+
+        float hour_angle = (time / 43200.0) * 2.0 * PI;
+        c = mix(c, 0.0, hand(a, r, hour_angle, 2.0, 0.2, bumps[2] / 10.0));
+
+        // add a final dim halo around the edge
+        float y = 0.3 * exp(-15.0 * (r - 1.0 - bump_offset * 0.1));
+        c = min(c, 1.0 - y);
+      } else if (r <= 1.0) {
+        c = mix(c, 0.0, i_ring(a, r));
+      }
+      gl_FragColor = vec4(c, c, c, 1.0);
+    }
+  `;
+
+  // Initialize the shader program
+  const shaderProgram = initShaderProgram(gl, vsSource, fsSource);
+
+  // Collect all the info needed to use the shader program.
+  // Look up which attribute our shader program is using
+  // for aVertexPosition and look up uniform locations.
+  const programInfo = {
+    program: shaderProgram,
+    attribLocations: {
+      vertexPosition: gl.getAttribLocation(shaderProgram, 'aVertexPosition'),
+    },
+    uniformLocations: {
+      projectionMatrix: gl.getUniformLocation(shaderProgram, 'uProjectionMatrix'),
+      now: gl.getUniformLocation(shaderProgram, 'now'),
+      time: gl.getUniformLocation(shaderProgram, 'time'),
+      bumps: gl.getUniformLocation(shaderProgram, 'bumps'),
+    },
+  };
+
+  // Here's where we call the routine that builds all the
+  // objects we'll be drawing.
+  const buffers = initBuffers(gl);
+
+  // The main draw loop.
+  function render(now) {
+    drawScene(gl, programInfo, buffers, now / 1000.0);
+
+    requestAnimationFrame(render);
+  }
+  requestAnimationFrame(render);
+}
+
+//
+// initBuffers
+//
+// Initialize the buffers we'll need. For this demo, we just
+// have one object -- a simple two-dimensional square.
+//
+function initBuffers(gl) {
+
+  // Create a buffer for the square's positions.
+  const positionBuffer = gl.createBuffer();
+
+  // Select the positionBuffer as the one to apply buffer
+  // operations to from here out.
+  gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+
+  // Now create an array of positions for the square.
+  // this is just a 4x4 square on the X/Y axis
+  const positions = [
+    -2.0,  2.0, 0.0,
+     2.0,  2.0, 0.0,
+    -2.0, -2.0, 0.0,
+     2.0, -2.0, 0.0,
+  ];
+
+  // Now pass the list of positions into WebGL to build the
+  // shape. We do this by creating a Float32Array from the
+  // JavaScript array, then use it to fill the current buffer.
+  gl.bufferData(gl.ARRAY_BUFFER,
+                new Float32Array(positions),
+                gl.STATIC_DRAW);
+
+  return {
+    position: positionBuffer,
+  };
+}
+
+//
+// Draw the scene.
+//
+function drawScene(gl, programInfo, buffers, now) {
+  // offset our bump acceleration by some amount, biased towards 0.0 and
+  // soft limited to [-0.5, 0.5].  "Soft limited" means that there is no hard
+  // stop preventing it from exceeding the limits but it will trend towards the
+  // center.
+  bumpAcc = bumpAcc.map(x => {
+    const x2 = x / 2.0;
+    const db = Math.random() - 0.5 - x2 * Math.abs(x2);
+    return x + db / 100.0;
+  });
+
+  // and apply that acceleration to the bumps, clamped to [-1.0, 1.0]
+  bumps = bumps.map((x, i) => {
+    const x2 = x / 2.0;
+    const db = bumpAcc[i] - x2 * Math.abs(x2);
+    return x + db / 10.0;
+  });
+
+  gl.clearColor(1.0, 1.0, 1.0, 1.0);  // Clear to white, fully opaque
+
+  // Clear the canvas before we start drawing on it.
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  // Create an orthographic projection matrix. Probably could have hard-coded
+  // this but *shrug*.
+  //
+  // note: glmatrix.js always has the first argument
+  // as the destination to receive the result.
+  const projectionMatrix = mat4.create();
+  mat4.ortho(projectionMatrix, -2, 2, -2, 2, -2, 2);
+
+  // Tell WebGL how to pull out the positions from the position
+  // buffer into the vertexPosition attribute.
+  {
+    const numComponents = 3;
+    const type = gl.FLOAT;
+    const normalize = false;
+    const stride = 0;
+    const offset = 0;
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffers.position);
+    gl.vertexAttribPointer(
+        programInfo.attribLocations.vertexPosition,
+        numComponents,
+        type,
+        normalize,
+        stride,
+        offset);
+    gl.enableVertexAttribArray(
+        programInfo.attribLocations.vertexPosition);
+  }
+
+  // Tell WebGL to use our program when drawing
+  gl.useProgram(programInfo.program);
+
+  // `time` is the value used to calculate drawing the clock arms. It is a
+  // local time value in fractional seconds and wraps every 12h.
+  //
+  // Don't confuse this with `now`, which is an arbitrary monotonic time value
+  // simply used to drive the animations.
+  const t = new Date();
+  const tzOffset = t.getTimezoneOffset() * 60;
+  const time = ((t.getTime() / 1000.0) - tzOffset) % 43200;
+
+  // Set the shader uniforms
+  gl.uniformMatrix4fv(
+      programInfo.uniformLocations.projectionMatrix,
+      false,
+      projectionMatrix);
+  gl.uniform1f(
+      programInfo.uniformLocations.time,
+      time);
+  gl.uniform1f(
+      programInfo.uniformLocations.now,
+      now);
+  gl.uniform1fv(
+      programInfo.uniformLocations.bumps,
+      bumps
+  );
+
+  // and draw that beautiful rectangle
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+//
+// Initialize a shader program, so WebGL knows how to draw our data. This is
+// pretty much boilerplate GL initialization.
+//
+function initShaderProgram(gl, vsSource, fsSource) {
+  const vertexShader = loadShader(gl, gl.VERTEX_SHADER, vsSource);
+  const fragmentShader = loadShader(gl, gl.FRAGMENT_SHADER, fsSource);
+
+  // Create the shader program
+  const shaderProgram = gl.createProgram();
+  gl.attachShader(shaderProgram, vertexShader);
+  gl.attachShader(shaderProgram, fragmentShader);
+  gl.linkProgram(shaderProgram);
+
+  // If creating the shader program failed, alert
+  if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+    alert('Unable to initialize the shader program: ' + gl.getProgramInfoLog(shaderProgram));
+    return null;
+  }
+
+  return shaderProgram;
+}
+
+//
+// Creates a shader of the given type, uploads the source and
+// compiles it. More boilerplate.
+//
+function loadShader(gl, type, source) {
+  const shader = gl.createShader(type);
+
+  // Send the source to the shader object
+  gl.shaderSource(shader, source);
+
+  // Compile the shader program
+  gl.compileShader(shader);
+
+  // See if it compiled successfully
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    alert('An error occurred compiling the shaders: ' + gl.getShaderInfoLog(shader));
+    gl.deleteShader(shader);
+    return null;
+  }
+
+  return shader;
+}
+
+// run main when the page is done loading
+window.addEventListener('load', main);
+</script>
